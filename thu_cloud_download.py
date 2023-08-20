@@ -6,6 +6,7 @@ import os
 import re
 from tqdm import tqdm
 import requests
+import urllib.parse
 
 sess = requests.Session()
 
@@ -56,7 +57,8 @@ def verify_password(pwd: str, share_key: str):
 def dfs_search_files(share_key: str, path="/"):
     global sess
     filelist = []
-    r = sess.get('https://cloud.tsinghua.edu.cn/api/v2.1/share-links/{}/dirents/?path={}'.format(share_key, path))
+    encoded_path = urllib.parse.quote(path)
+    r = sess.get('https://cloud.tsinghua.edu.cn/api/v2.1/share-links/{}/dirents/?path={}'.format(share_key, encoded_path))
     objects = r.json()['dirent_list']
     for obj in objects:
         if obj["is_dir"]:
@@ -125,7 +127,10 @@ def download(args):
 if __name__ == '__main__':
     """
     用法:
-    python thu_cloud_download.py -l https://cloud.tsinghua.edu.cn/d/1234567890/ -s "path_to_save"
+    python thu_cloud_download.py 
+    -l https://cloud.tsinghua.edu.cn/d/1234567890/ 
+    -s "~/path_to_save" 
+    -f "\.pptx?$" (regex, 正则表达式)
     """
     args = parse_args()
     download(args)
