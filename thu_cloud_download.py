@@ -130,7 +130,7 @@ if __name__ == '__main__':
     python thu_cloud_download.py 
     -l https://cloud.tsinghua.edu.cn/d/1234567890/ 
     -s "~/path_to_save" 
-    -f "\.pptx?$" (regex, 正则表达式)
+    -f "*.pptx?" (regex, 正则表达式)
     """
     args = parse_args()
     download(args)
