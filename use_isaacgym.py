@@ -57,10 +57,6 @@ def main():
     sim_params.physx.num_velocity_iterations = 1  # PhysX solver velocity iterations count. default 1
     sim_params.physx.contact_offset = 0.02
     sim_params.physx.rest_offset = 0.01
-    sim_params.bounce_threshold_velocity = 0.2  # a contact with a relative velocity below this will not bounce
-    sim_params.max_depenetration_velocity = 100.0  # the max vel permitted to be introduced by the solver
-    sim_params.friction_offset_threshold = 0.04  # the contact distance at which friction starts being computed
-    sim_params.friction_correlation_distance = 0.025
     # create sim with these parameters
     # args: 计算GPU id, 渲染GPU id, 物理引擎, 仿真参数
     sim = gym.create_sim(0, 0, gymapi.SIM_PHYSX, sim_params)
@@ -87,7 +83,7 @@ def main():
     asset_options.disable_gravity = False
     asset_options.enable_gyroscopic_forces = True
     asset_options.fix_base_link = False  # 把机器人基座固定在出生点
-    asset_options.flip_visual_attachments = True  # visual材质默认y-up, 需要手动更改为z-up
+    asset_options.flip_visual_attachments = False  # visual材质可能需要翻转为y-up/z-up
     asset_options.linear_damping = 0.0
     asset_options.max_angular_velocity = 64.0
     asset_options.max_linear_velocity = 1000.0
@@ -140,7 +136,7 @@ def main():
 
         # actor DoF属性. 一般在urdf中已经定义, 但也可以override
         props = gym.get_actor_dof_properties(env, actor_handle)
-        props['hasLimits'].fill(True)  # DOF pos是否有限制. 但属性似乎无法override
+        # props['hasLimits'].fill(True)  # DOF pos是否有限制. 但属性似乎无法override
         props['lower'].fill(-1.0)  # limit下界
         props['upper'].fill(1.0)  # limit上界
         # 驱动模式, 有以下三种. 单位均为标准单位: m, rad, m/s, rad/s, N, Nm
@@ -190,9 +186,9 @@ def main():
         # body_states['vel']['angular']     all angular velocities (Vec3: x, y, z)
 
         # 也可以设置运动状态
-        gym.set_actor_rigid_body_states(env, actor_handle, body_states, gymapi.STATE_ALL)
-        gym.set_env_rigid_body_states(env, body_states, gymapi.STATE_POS)
-        gym.set_sim_rigid_body_states(sim, body_states, gymapi.STATE_VEL)
+        # gym.set_actor_rigid_body_states(env, actor_handle, body_states, gymapi.STATE_ALL)
+        # gym.set_env_rigid_body_states(env, body_states, gymapi.STATE_POS)
+        # gym.set_sim_rigid_body_states(sim, body_states, gymapi.STATE_VEL)
 
         # 查询body states array中某一特定body的index
         i1 = gym.find_actor_rigid_body_index(env, actor_handle, 'body_name', gymapi.DOMAIN_ACTOR)
