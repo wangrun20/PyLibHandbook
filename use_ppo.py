@@ -1,22 +1,24 @@
+import time
 from dataclasses import dataclass
-from typing import Optional
 from functools import partial
+from typing import Optional
 
-from gymnasium import spaces
 import matplotlib.pyplot as plt
 import numpy as np
-from rsl_rl.env import VecEnv
-from rsl_rl.runners import OnPolicyRunner
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from gymnasium import spaces
+from rsl_rl.env import VecEnv
+from rsl_rl.runners import OnPolicyRunner
 from torch.distributions.normal import Normal
+from torch.utils.tensorboard import SummaryWriter
 
 
 @dataclass
 class PPOConfig:
     # 训练配置
-    num_iterations: int = 1500
+    num_iterations: int = 1000
     learning_rate: float = 1e-3
     num_steps: int = 24
     schedule: str = 'adaptive'
@@ -41,6 +43,7 @@ class PPOConfig:
 
 class DummyEnv(object):
     """用纯torch实现的简单2D质点运动环境，支持批处理"""
+
     def __init__(self, dt=0.01, num_envs=1024, device="cuda"):
         self.dt = dt
         self.num_envs = num_envs
@@ -100,6 +103,7 @@ class DummyEnv(object):
 
 class DummyEnvRSL(VecEnv):
     """将DummyEnv适配为rsl_rl兼容的环境"""
+
     def __init__(self, dt=0.01, num_envs=1024, device="cuda"):
         self.dummy_env = DummyEnv(dt=dt, num_envs=num_envs, device=device)
 
@@ -173,7 +177,7 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class Agent(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int):
+    def __init__(self, obs_dim: int, act_dim: int, init_noise_std=1.0):
         super().__init__()
         self.critic = nn.Sequential(
             layer_init(nn.Linear(obs_dim, 64)),
@@ -189,7 +193,7 @@ class Agent(nn.Module):
             nn.ELU(),
             layer_init(nn.Linear(64, act_dim), std=0.01),
         )
-        self.actor_logstd = nn.Parameter(torch.zeros(1, act_dim))
+        self.actor_std = nn.Parameter(torch.ones(1, act_dim) * init_noise_std)
 
     def get_value(self, obs):
         return self.critic(obs)
@@ -199,13 +203,12 @@ class Agent(nn.Module):
         return action_mean
 
     def get_action_std(self):
-        action_std = torch.exp(self.actor_logstd)
+        action_std = self.actor_std
         return action_std
 
     def get_action_and_value(self, obs, action=None):
         action_mean = self.actor_mean(obs)
-        action_logstd = self.actor_logstd.expand_as(action_mean)
-        action_std = torch.exp(action_logstd)
+        action_std = self.actor_std.expand_as(action_mean)
         probs = Normal(action_mean, action_std)
         if action is None:
             action = probs.sample()
@@ -213,7 +216,7 @@ class Agent(nn.Module):
 
 
 class MyPPO(object):
-    def __init__(self, env, config: PPOConfig):
+    def __init__(self, env, config: PPOConfig, log_dir: Optional[str]):
         self.env = env
         self.num_envs = self.env.num_envs
 
@@ -222,6 +225,11 @@ class MyPPO(object):
         self.config.minibatch_size = int(self.config.batch_size // self.config.num_minibatches)
 
         self.device = self.env.device
+
+        self.writer = None
+        if log_dir:
+            run_name = f"ppo_{int(time.time())}"
+            self.writer = SummaryWriter(f"{log_dir}/{run_name}")
 
         assert isinstance(self.env.single_observation_space, spaces.Box)
         assert isinstance(self.env.single_action_space, spaces.Box)
@@ -244,7 +252,7 @@ class MyPPO(object):
         self.next_obs = torch.zeros((self.num_envs,) + self.obs_dim, device=self.device)
         self.next_done = torch.zeros((self.num_envs,), device=self.device)
         self.global_step = 0
-        self.current_iteration = 0
+        self.iteration = 0
 
     def reset(self):
         next_obs, _ = self.env.reset()
@@ -262,10 +270,13 @@ class MyPPO(object):
             if callback:
                 callback(train_info)
 
+        if self.writer:
+            self.writer.close()
+
         return {'all_infos': all_infos}
 
     def train_step(self):
-        self.current_iteration += 1
+        self.iteration += 1
 
         rollout_info = self.collect_rollouts()
 
@@ -273,14 +284,16 @@ class MyPPO(object):
 
         update_info = self.update_policy(advantages, returns)
 
-        mean_std = torch.mean(self.agent.get_action_std().detach()).item()
+        mean_noise_std = torch.mean(self.agent.get_action_std().detach()).item()
 
         train_info = {'rollout_info': rollout_info,
                       'update_info': update_info,
-                      'iteration': self.current_iteration,
+                      'iteration': self.iteration,
                       'global_step': self.global_step,
-                      'mean_std': mean_std,
-                      'lr': self.learning_rate}
+                      'mean_noise_std': mean_noise_std}
+
+        if self.writer:
+            self.log_to_tensorboard(train_info)
 
         return train_info
 
@@ -325,6 +338,8 @@ class MyPPO(object):
                 lastgaelam = delta + self.config.gamma * self.config.gae_lambda * nextnonterminal * lastgaelam
                 advantages[t] = lastgaelam
             returns = advantages + self.values
+        if not self.config.norm_adv:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         return advantages, returns
 
     def update_policy(self, advantages, returns):
@@ -343,9 +358,9 @@ class MyPPO(object):
         b_inds = np.arange(self.config.batch_size)
         clipfracs = []
 
-        pg_loss = torch.tensor(float('nan'))
-        v_loss = torch.tensor(float('nan'))
-        entropy_loss = torch.tensor(float('nan'))
+        mean_surrogate_loss = 0.0
+        mean_value_loss = 0.0
+        mean_entropy = 0.0
         for epoch in range(self.config.update_epochs):
             np.random.shuffle(b_inds)
             for start in range(0, self.config.batch_size, self.config.minibatch_size):
@@ -356,13 +371,29 @@ class MyPPO(object):
                 ratio = logratio.exp()
 
                 with torch.no_grad():
-                    old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > self.config.clip_coef).float().mean().item()]
 
                 mb_advantages = b_advantages[mb_inds]
                 if self.config.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+
+                if self.config.target_kl is not None and self.config.schedule == "adaptive":
+                    with torch.inference_mode():
+                        mu_mb = self.agent.get_action_mean(b_obs[mb_inds])
+                        sigma_mb = self.agent.get_action_std().expand_as(mu_mb)
+                        old_mu_mb = old_mu_batch[mb_inds]
+                        old_sigma_mb = old_sigma_batch[mb_inds]
+                        kl = torch.sum(torch.log(sigma_mb / old_sigma_mb + 1e-5) +
+                                       (torch.square(old_sigma_mb) + torch.square(old_mu_mb - mu_mb))
+                                       / (2.0 * torch.square(sigma_mb)) - 0.5, dim=-1)
+                        kl_mean = torch.mean(kl)
+                        if kl_mean > self.config.target_kl * 2.0:
+                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                        elif 0.0 < kl_mean < (self.config.target_kl / 2.0):
+                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                        for param_group in self.optimizer.param_groups:
+                            param_group["lr"] = self.learning_rate
 
                 # 策略损失
                 pg_loss1 = -mb_advantages * ratio
@@ -389,41 +420,36 @@ class MyPPO(object):
                 nn.utils.clip_grad_norm_(self.agent.parameters(), self.config.max_grad_norm)
                 self.optimizer.step()
 
-                if self.config.target_kl is not None and self.config.schedule == "adaptive":
-                    with torch.inference_mode():
-                        mu_mb = self.agent.get_action_mean(b_obs[mb_inds])
-                        sigma_mb = self.agent.get_action_std().expand_as(mu_mb)
-                        old_mu_mb = old_mu_batch[mb_inds]
-                        old_sigma_mb = old_sigma_batch[mb_inds]
-                        kl = torch.sum(torch.log(sigma_mb / old_sigma_mb + 1.0e-5) +
-                                       (torch.square(old_sigma_mb) + torch.square(old_mu_mb - mu_mb))
-                                       / (2.0 * torch.square(sigma_mb)) - 0.5, dim=-1)
-                        kl_mean = torch.mean(kl)
-                        if kl_mean > self.config.target_kl * 2.0:
-                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                        elif 0.0 < kl_mean < (self.config.target_kl / 2.0):
-                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
-                        for param_group in self.optimizer.param_groups:
-                            param_group["lr"] = self.learning_rate
+                mean_surrogate_loss += pg_loss.item()
+                mean_value_loss += v_loss.item()
+                mean_entropy += entropy_loss.item()
 
             if self.config.target_kl is not None and approx_kl > self.config.target_kl:
                 break
 
-        # 计算解释方差
-        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
-        var_y = np.var(y_true)
-        explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-
-        update_info = {'policy_loss': pg_loss.item(),
-                       'value_loss': v_loss.item(),
-                       'entropy_loss': entropy_loss.item(),
-                       'old_approx_kl': old_approx_kl.item(),
-                       'approx_kl': approx_kl.item(),
-                       'clipfrac': np.mean(clipfracs),
-                       'explained_variance': explained_var,
-                       'learning_rate': self.optimizer.param_groups[0]["lr"]}
+        update_info = {'learning_rate': self.optimizer.param_groups[0]["lr"],
+                       'surrogate': mean_surrogate_loss / self.config.update_epochs / self.config.num_minibatches,
+                       'value_function': mean_value_loss / self.config.update_epochs / self.config.num_minibatches,
+                       'entropy': mean_entropy / self.config.update_epochs / self.config.num_minibatches}
 
         return update_info
+
+    def log_to_tensorboard(self, info: dict):
+        iteration = info['iteration']
+        rollout_info = info['rollout_info']
+        update_info = info['update_info']
+
+        self.writer.add_scalar("Episode/episode_length", rollout_info['episode_length'], iteration)
+        self.writer.add_scalar("Episode/episode_reward", rollout_info['episode_reward'], iteration)
+        self.writer.add_scalar("Episode/single_reward_distance", rollout_info['single_reward_distance'], iteration)
+
+        self.writer.add_scalar("Loss/entropy", update_info['entropy'], iteration)
+        self.writer.add_scalar("Loss/learning_rate", update_info['learning_rate'], iteration)
+        self.writer.add_scalar("Loss/surrogate", update_info['surrogate'], iteration)
+        self.writer.add_scalar("Loss/value_function", update_info['value_function'], iteration)
+
+        self.writer.add_scalar("Policy/mean_noise_std", info['mean_noise_std'], iteration)
+
 
     def save(self, path: str):
         """保存模型"""
@@ -432,7 +458,7 @@ class MyPPO(object):
             'optimizer_state_dict': self.optimizer.state_dict(),
             'config': self.config,
             'global_step': self.global_step,
-            'current_iteration': self.current_iteration
+            'iteration': self.iteration
         }, path)
 
     def load(self, path: str):
@@ -441,7 +467,7 @@ class MyPPO(object):
         self.agent.load_state_dict(checkpoint['agent_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.global_step = checkpoint.get('global_step', 0)
-        self.current_iteration = checkpoint.get('current_iteration', 0)
+        self.iteration = checkpoint.get('iteration', 0)
 
     def get_action(self, obs, deterministic: bool = False):
         """获取动作（用于推理）"""
@@ -458,7 +484,7 @@ class MyPPO(object):
 def using_my_ppo():
     env = DummyEnv()
     ppo_config = PPOConfig()
-    ppo = MyPPO(env=env, config=ppo_config)
+    ppo = MyPPO(env=env, config=ppo_config, log_dir='exp')
 
     def training_callback(info):
         print(f"================\n"
@@ -466,8 +492,8 @@ def using_my_ppo():
               f"Avg Length = {info['rollout_info']['episode_length']:.2f}\n"
               f"Avg Reward = {info['rollout_info']['episode_reward']:.2f}\n"
               f"Dis Reward = {info['rollout_info']['single_reward_distance']:.2f}\n"
-              f"   Avg Std = {info['mean_std']:.3f}\n"
-              f"        lr = {info['lr']:.3e}\n")
+              f"   Avg Std = {info['mean_noise_std']:.3f}\n"
+              f"        lr = {info['update_info']['learning_rate']:.3e}\n")
 
     print("开始训练...")
     ppo.train(callback=training_callback)
@@ -512,10 +538,10 @@ def using_rsl_rl():
 
     runner = OnPolicyRunner(env=env,
                             train_cfg=train_cfg,
-                            log_dir='exp',
+                            log_dir='exp/rsl_rl',
                             device=env.device)
 
-    runner.learn(num_learning_iterations=1000, init_at_random_ep_len=True)
+    runner.learn(num_learning_iterations=1000, init_at_random_ep_len=False)
 
     eval_and_plot(runner.get_inference_policy(),
                   DummyEnv(dt=env.dummy_env.dt, num_envs=1, device=env.dummy_env.device))
