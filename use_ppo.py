@@ -60,7 +60,7 @@ class DummyEnv(object):
         self.single_action_space = spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32)  # 动作：[ax, ay]
 
     def reset(self):
-        self.state = torch.randn(size=(self.num_envs, 4), device=self.device) * 2.0
+        self.state = torch.randn(size=(self.num_envs, 4), device=self.device) * 10.0
         self.episode_length = torch.zeros(size=(self.num_envs,), device=self.device)
         next_obs = self.state.clone()
         return next_obs, self.infos
@@ -78,7 +78,7 @@ class DummyEnv(object):
         self.episode_length += 1
         self.episode_reward += reward
 
-        terminations = torch.norm(new_pos, dim=1) > 5.0  # 终止条件：距离原点太远或步数太多
+        terminations = torch.norm(new_pos, dim=1) > 100.0  # 终止条件：距离原点太远或步数太多
         truncations = torch.greater_equal(self.episode_length, 1000)
         dones = torch.logical_or(terminations, truncations)
 
@@ -93,7 +93,7 @@ class DummyEnv(object):
 
         # auto reset
         self.state = torch.where(
-            dones[:, None], torch.randn(size=self.state.shape, device=self.device) * 2.0, self.state)
+            dones[:, None], torch.randn(size=self.state.shape, device=self.device) * 10.0, self.state)
         self.episode_length = torch.where(dones, 0, self.episode_length)
         self.episode_reward = torch.where(dones, 0, self.episode_reward)
         next_obs = self.state.clone()
@@ -338,8 +338,8 @@ class MyPPO(object):
                 lastgaelam = delta + self.config.gamma * self.config.gae_lambda * nextnonterminal * lastgaelam
                 advantages[t] = lastgaelam
             returns = advantages + self.values
-        if not self.config.norm_adv:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            if not self.config.norm_adv:
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         return advantages, returns
 
     def update_policy(self, advantages, returns):
@@ -369,10 +369,6 @@ class MyPPO(object):
                 _, newlogprob, entropy, newvalue = self.agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
-
-                with torch.no_grad():
-                    approx_kl = ((ratio - 1) - logratio).mean()
-                    clipfracs += [((ratio - 1.0).abs() > self.config.clip_coef).float().mean().item()]
 
                 mb_advantages = b_advantages[mb_inds]
                 if self.config.norm_adv:
@@ -424,9 +420,6 @@ class MyPPO(object):
                 mean_value_loss += v_loss.item()
                 mean_entropy += entropy_loss.item()
 
-            if self.config.target_kl is not None and approx_kl > self.config.target_kl:
-                break
-
         update_info = {'learning_rate': self.optimizer.param_groups[0]["lr"],
                        'surrogate': mean_surrogate_loss / self.config.update_epochs / self.config.num_minibatches,
                        'value_function': mean_value_loss / self.config.update_epochs / self.config.num_minibatches,
@@ -449,7 +442,6 @@ class MyPPO(object):
         self.writer.add_scalar("Loss/value_function", update_info['value_function'], iteration)
 
         self.writer.add_scalar("Policy/mean_noise_std", info['mean_noise_std'], iteration)
-
 
     def save(self, path: str):
         """保存模型"""
